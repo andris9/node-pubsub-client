@@ -1,14 +1,13 @@
 var Subscriber = require("./subscriber").Subscriber,
     redis = require("redis"),
     http = require("http"),
-    sys = require("sys"),
     URL = require("url"),
     xml2js = require('xml2js'),
     crypto=require("crypto");
 
 this.SubscriptionHandler = {
     
-    verification_token: false,
+    verify_token: false,
     pubsub_receiver: false,
     port: false,
     client: redis.createClient(),
@@ -17,9 +16,9 @@ this.SubscriptionHandler = {
     
     expire_delay: 500,
 
-    init: function(verification_token, pubsub_receiver, db, port){
+    init: function(pubsub_receiver, verify_token, db, port){
         
-        this.verification_token = verification_token || false;
+        this.verify_token = verify_token || false;
         this.pubsub_receiver = pubsub_receiver || false;
         this.db = db || 0;
         this.port = port || 10081;
@@ -63,12 +62,16 @@ this.SubscriptionHandler = {
                     }).bind(this));
     },
     
-    removeBlog: function(url, callback){
+    removeBlog: function(url, unsubscribe, callback){
         this.client.hmget("blog:"+sha1(url), "rss", "pubsub", "title", (function(err, result){
             if(result && result.length){
                 feed = result[0].toString("utf-8");
                 pubsub = result[1].toString("utf-8");
                 title = result[2].toString("utf-8");
+                
+                if(unsubscribe){
+                    
+                }
                 
                 this.client.multi().
                     del("blog:"+sha1(url)).
@@ -99,7 +102,31 @@ this.SubscriptionHandler = {
         }).bind(this));
     },
     
+    unsubscribeFromBlog: function(blog_data){
+        var subscriber;
+        
+        if(!blog_data.rss || !blog_data.pubsub){
+            console.log("Error! Invalid data");
+            return;
+        }
+                
+        console.log("Unsubscribing from "+blog_data.url+" at "+blog_data.pubsub);
+                
+        subscriber = new Subscriber(blog_data.pubsub, this.pubsub_receiver);
+        subscriber.verify_token = this.verify_token;
+        subscriber.unsubscribe(blog_data.rss, (function(err, data){
+            if(!err){
+                // remove from queue on error
+                this.removeFromQueue(blog_data.url, blog_data.rss);
+                this.updateExpireTimer();
+                console.log("Unsubscribed from "+blog_data.url);
+            }else
+                console.log("Unsubscribe error for "+blog_data.url);
+        }).bind(this));
+   },
+    
     subscribeToBlog: function(url){
+        var subscriber;
         this.client.hmget("blog:"+sha1(url), "rss", "pubsub", (function(err, result){
             if(result && result.length){
                 feed = result[0].toString("utf-8");
@@ -113,7 +140,7 @@ this.SubscriptionHandler = {
                 console.log("Subscribing to "+url+" at "+pubsub);
                 
                 subscriber = new Subscriber(pubsub, this.pubsub_receiver);
-                subscriber.verify_token = this.verification_token;
+                subscriber.verify_token = this.verify_token;
                 subscriber.subscribe(feed, (function(err, data){
                     if(err){
                         // remove from queue on error
@@ -141,7 +168,7 @@ this.SubscriptionHandler = {
         
         console.log("SUBSCRIPTION for "+(feed || "unknown?"));
         
-        if(!feed || data.query.hub.verify_token != this.verification_token ||
+        if(!feed || data.query.hub.verify_token != this.verify_token ||
                 !data.query.hub.topic || !data.query.hub.lease_seconds ||
                 !data.query.hub.challenge){
             
@@ -170,7 +197,7 @@ this.SubscriptionHandler = {
     managePosting: function(request, response){
 
         console.log("Incoming post");
-        var data = URL.parse(request.url, true),
+        var url_data = URL.parse(request.url, true),
             rss_data = "", parser;
         
         request.setEncoding("utf-8");
@@ -178,9 +205,13 @@ this.SubscriptionHandler = {
             rss_data += data;
         });
         
+        var sm = request.headers["x-hub-signature"];
+        
         request.on("end", (function(data){
             response.writeHead(200, {'Content-Type': 'text/plain'});
             response.end("OK");
+
+            // TODO: Check if feed is OK and update blog settings (title)
 
             var parser = new xml2js.Parser();
             parser.addListener('end', (function(result) {
